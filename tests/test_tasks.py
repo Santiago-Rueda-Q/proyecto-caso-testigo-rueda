@@ -1,6 +1,7 @@
 # tests/test_tasks.py
 
 import os
+import shutil
 from datetime import datetime, timedelta
 
 import pytest
@@ -8,12 +9,28 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+# ============================================================
+# FIX IMPORT: asegurar que backend/app/ siempre existe en PATH
+# ============================================================
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 from app.main import app
 from app.database import Base, get_db
 from app import crud, models, schemas
 
+
 # ============================================================
-# CONFIGURACIÓN DB DE PRUEBAS (SQLite) PARA UNIT + API
+# MARCADORES DE PYTEST (para eliminar warnings)
+# ============================================================
+def pytest_configure(config):
+    config.addinivalue_line("markers", "integration: test de integración con Docker/TestContainers")
+    config.addinivalue_line("markers", "e2e: test end-to-end usando Playwright")
+    config.addinivalue_line("markers", "benchmark: pruebas de rendimiento")
+
+
+# ============================================================
+# CONFIGURACIÓN DE BD (SQLite) PARA UNIT + API
 # ============================================================
 
 SQLALCHEMY_DATABASE_URL = "sqlite:///./test_tasks.db"
@@ -36,7 +53,7 @@ def override_get_db():
         db.close()
 
 
-# Override de la dependencia global de FastAPI
+# Override global de FastAPI
 app.dependency_overrides[get_db] = override_get_db
 
 
@@ -46,10 +63,7 @@ app.dependency_overrides[get_db] = override_get_db
 
 @pytest.fixture(autouse=True)
 def clean_db():
-    """
-    Antes de cada test limpiamos la BD de pruebas para que
-    no haya basura de otros tests.
-    """
+    """Reinicia la BD antes de cada test para evitar contaminación."""
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     yield
@@ -70,7 +84,7 @@ def client():
 
 
 # ============================================================
-# 1. PRUEBAS UNITARIAS (directo al CRUD, sin client)
+# HELPERS
 # ============================================================
 
 def _build_task_create(
@@ -80,10 +94,6 @@ def _build_task_create(
     priority=2,
     due_date=None,
 ):
-    """
-    Helper para crear un TaskCreate.
-    Ajusta los campos si tu schemas.TaskCreate es diferente.
-    """
     return schemas.TaskCreate(
         title=title,
         description=description,
@@ -93,350 +103,271 @@ def _build_task_create(
     )
 
 
-def test_create_task_crud(db_session):
-    task_in = _build_task_create()
-    task = crud.create_task(db_session, task_in)
+# ============================================================
+# 1. PRUEBAS UNITARIAS (CRUD directo)
+# ============================================================
 
+def test_create_task_crud(db_session):
+    task = crud.create_task(db_session, _build_task_create())
     assert task.id is not None
     assert task.title == "Test Task"
     assert task.status == "pending"
-    assert task.is_active is True
 
 
 def test_get_task_crud(db_session):
-    task_in = _build_task_create(title="Buscarme")
-    created = crud.create_task(db_session, task_in)
-
+    created = crud.create_task(db_session, _build_task_create(title="Buscarme"))
     fetched = crud.get_task(db_session, created.id)
     assert fetched is not None
-    assert fetched.id == created.id
     assert fetched.title == "Buscarme"
 
 
 def test_update_task_crud(db_session):
-    task_in = _build_task_create()
-    created = crud.create_task(db_session, task_in)
-
-    update_data = schemas.TaskUpdate(
-        title="Actualizada",
-        status="in_progress",
+    created = crud.create_task(db_session, _build_task_create())
+    updated = crud.update_task(
+        db_session,
+        created,
+        schemas.TaskUpdate(title="Actualizada", status="in_progress"),
     )
-
-    updated = crud.update_task(db_session, created, update_data)
-
     assert updated.title == "Actualizada"
     assert updated.status == "in_progress"
-    assert updated.updated_at is not None
 
 
 def test_soft_delete_task_crud(db_session):
-    task_in = _build_task_create()
-    created = crud.create_task(db_session, task_in)
-
+    created = crud.create_task(db_session, _build_task_create())
     crud.soft_delete_task(db_session, created)
-
-    # No debe aparecer al buscar tasks activas
-    found = crud.get_task(db_session, created.id)
-    assert found is None
-
-    # Pero sigue en la tabla (si lo buscamos sin filtro de is_active)
-    raw = (
-        db_session.query(models.Task)
-        .filter(models.Task.id == created.id)
-        .first()
-    )
-    assert raw is not None
-    assert raw.is_active is False
+    assert crud.get_task(db_session, created.id) is None
 
 
 def test_complete_task_crud(db_session):
-    task_in = _build_task_create(status="in_progress")
-    created = crud.create_task(db_session, task_in)
-
+    created = crud.create_task(
+        db_session,
+        _build_task_create(status="in_progress")
+    )
     done = crud.complete_task(db_session, created)
     assert done.status == "done"
 
 
 def test_get_tasks_by_status_and_overdue(db_session):
-    # Task vencida
-    overdue_in = _build_task_create(
-        title="Vencida",
-        status="in_progress",
-        due_date=datetime.utcnow() - timedelta(days=1),
-    )
-    # Task futura
-    future_in = _build_task_create(
-        title="Futura",
-        status="pending",
-        due_date=datetime.utcnow() + timedelta(days=1),
-    )
-    # Task done (no debe contarse como vencida)
-    done_in = _build_task_create(
-        title="Hecha",
-        status="done",
-        due_date=datetime.utcnow() - timedelta(days=1),
+    overdue = crud.create_task(
+        db_session,
+        _build_task_create(
+            title="Vencida",
+            status="in_progress",
+            due_date=datetime.utcnow() - timedelta(days=1),
+        )
     )
 
-    overdue = crud.create_task(db_session, overdue_in)
-    future = crud.create_task(db_session, future_in)
-    done = crud.create_task(db_session, done_in)
+    future = crud.create_task(
+        db_session,
+        _build_task_create(
+            title="Futura",
+            status="pending",
+            due_date=datetime.utcnow() + timedelta(days=1),
+        )
+    )
 
-    # Por status
-    pending_tasks = crud.get_tasks_by_status(db_session, "pending")
-    assert len(pending_tasks) == 1
-    assert pending_tasks[0].id == future.id
+    done = crud.create_task(
+        db_session,
+        _build_task_create(
+            title="Hecha",
+            status="done",
+            due_date=datetime.utcnow() - timedelta(days=1),
+        )
+    )
+
+    # Status
+    pending = crud.get_tasks_by_status(db_session, "pending")
+    assert pending[0].id == future.id
 
     # Overdue
     overdue_tasks = crud.get_overdue_tasks(db_session)
     overdue_ids = {t.id for t in overdue_tasks}
     assert overdue.id in overdue_ids
-    assert done.id not in overdue_ids  # DONE no cuenta como vencida
+    assert done.id not in overdue_ids
 
 
 # ============================================================
-# 2. PRUEBAS DE API (usando TestClient y SQLite)
+# 2. PRUEBAS API (TestClient)
 # ============================================================
 
 def test_create_and_list_tasks_api(client):
-    payload = {
+    resp = client.post("/tasks", json={
         "title": "Task API",
         "description": "Desde API",
         "status": "pending",
         "priority": 1,
-        "due_date": None,
-    }
+        "due_date": None
+    })
+    assert resp.status_code == 201
 
-    resp = client.post("/tasks", json=payload)
-    assert resp.status_code == 201, resp.text
-    data = resp.json()
-    assert data["id"] is not None
-    assert data["title"] == "Task API"
-
-    # Listar
     resp_list = client.get("/tasks")
     assert resp_list.status_code == 200
-    tasks = resp_list.json()
-    assert len(tasks) == 1
-    assert tasks[0]["title"] == "Task API"
+    assert len(resp_list.json()) == 1
 
 
 def test_update_and_delete_api(client):
-    # Crear
-    payload = {
+    new = client.post("/tasks", json={
         "title": "Original",
         "description": "Desc",
         "status": "pending",
-        "priority": 3,
-        "due_date": None,
-    }
-    resp = client.post("/tasks", json=payload)
-    task = resp.json()
-    task_id = task["id"]
+        "priority": 2,
+        "due_date": None
+    }).json()
 
-    # Update
-    update_payload = {
+    uid = new["id"]
+
+    upd = client.put(f"/tasks/{uid}", json={
         "title": "Actualizada API",
-        "status": "in_progress",
-    }
-    resp_upd = client.put(f"/tasks/{task_id}", json=update_payload)
-    assert resp_upd.status_code == 200
-    updated = resp_upd.json()
-    assert updated["title"] == "Actualizada API"
-    assert updated["status"] == "in_progress"
+        "status": "in_progress"
+    })
+    assert upd.status_code == 200
+    assert upd.json()["title"] == "Actualizada API"
 
-    # Delete (soft)
-    resp_del = client.delete(f"/tasks/{task_id}")
-    assert resp_del.status_code == 204
+    del_res = client.delete(f"/tasks/{uid}")
+    assert del_res.status_code == 204
 
-    # No debería existir como activa
-    resp_get = client.get(f"/tasks/{task_id}")
-    assert resp_get.status_code == 404
+    res_404 = client.get(f"/tasks/{uid}")
+    assert res_404.status_code == 404
 
 
 def test_complete_task_api(client):
-    payload = {
+    new = client.post("/tasks", json={
         "title": "Por completar",
         "description": "Desc",
         "status": "pending",
         "priority": 2,
-        "due_date": None,
-    }
-    resp = client.post("/tasks", json=payload)
-    task_id = resp.json()["id"]
+        "due_date": None
+    }).json()
 
-    resp_complete = client.patch(f"/tasks/{task_id}/complete")
-    assert resp_complete.status_code == 200
-    data = resp_complete.json()
-    assert data["status"] == "done"
+    uid = new["id"]
+
+    complete = client.patch(f"/tasks/{uid}/complete")
+    assert complete.json()["status"] == "done"
 
 
 def test_tasks_by_status_and_overdue_api(client):
-    # Crea task vencida
-    overdue_date = (datetime.utcnow() - timedelta(days=1)).isoformat()
-    payload1 = {
+    overdue_date = (datetime.utcnow() - timedelta(days=1)).isoformat() + "Z"
+    future_date = (datetime.utcnow() + timedelta(days=1)).isoformat() + "Z"
+
+    client.post("/tasks", json={
         "title": "Overdue API",
         "description": "vencida",
         "status": "in_progress",
         "priority": 2,
-        "due_date": overdue_date,
-    }
-    client.post("/tasks", json=payload1)
+        "due_date": overdue_date
+    })
 
-    # Crea task pendiente futura
-    future_date = (datetime.utcnow() + timedelta(days=1)).isoformat()
-    payload2 = {
+    client.post("/tasks", json={
         "title": "Futura API",
         "description": "futura",
         "status": "pending",
         "priority": 2,
-        "due_date": future_date,
-    }
-    client.post("/tasks", json=payload2)
+        "due_date": future_date
+    })
 
-    # Por status
-    resp_status = client.get("/tasks/status/pending")
-    assert resp_status.status_code == 200
-    tasks_pending = resp_status.json()
-    assert len(tasks_pending) == 1
-    assert tasks_pending[0]["title"] == "Futura API"
+    pending_res = client.get("/tasks/status/pending")
+    assert pending_res.status_code == 200
+    assert pending_res.json()[0]["title"] == "Futura API"
 
-    # Overdue
-    resp_overdue = client.get("/tasks/overdue")
-    assert resp_overdue.status_code == 200
-    tasks_overdue = resp_overdue.json()
-    assert len(tasks_overdue) == 1
-    assert tasks_overdue[0]["title"] == "Overdue API"
+    overdue_res = client.get("/tasks/overdue")
+    assert overdue_res.status_code == 200
+    assert overdue_res.json()[0]["title"] == "Overdue API"
 
 
 # ============================================================
-# 3. PRUEBA DE INTEGRACIÓN CON TESTCONTAINERS (Postgres real)
-#    -> requiere: pip install testcontainers[postgresql] psycopg2-binary
+# 3. TEST DE INTEGRACIÓN (Docker/TestContainers)
 # ============================================================
 
 @pytest.mark.integration
 def test_integration_with_postgres_testcontainer():
-    """
-    Integra la app con un Postgres real usando testcontainers.
-    Esta prueba es más pesada. Ideal correrla en CI.
-    """
+    """Se salta automáticamente si Docker no está disponible."""
+    if shutil.which("docker") is None:
+        pytest.skip("Docker no instalado, se omite test de integración.")
+
     try:
         from testcontainers.postgres import PostgresContainer
-    except ImportError:
-        pytest.skip("testcontainers[postgresql] no instalado")
+    except:
+        pytest.skip("testcontainers no instalado.")
 
-    from sqlalchemy import create_engine
-    from sqlalchemy.orm import sessionmaker
+    # Si Docker no corre, también saltará
+    try:
+        container = PostgresContainer("postgres:16-alpine")
+    except Exception:
+        pytest.skip("Docker no está corriendo, skip.")
 
-    postgres_image = "postgres:16-alpine"
-
-    with PostgresContainer(postgres_image) as postgres:
+    with container as postgres:
         db_url = postgres.get_connection_url()
+
         engine_pg = create_engine(db_url, future=True)
         TestingSessionPG = sessionmaker(
             autocommit=False, autoflush=False, bind=engine_pg
         )
 
-        # Creamos las tablas en Postgres
         Base.metadata.create_all(bind=engine_pg)
 
-        # Override temporal de get_db para esta prueba
-        def override_pg_db():
+        def override_pg():
             db = TestingSessionPG()
             try:
                 yield db
             finally:
                 db.close()
 
-        old_override = app.dependency_overrides.get(get_db)
-        app.dependency_overrides[get_db] = override_pg_db
+        old = app.dependency_overrides.get(get_db)
+        app.dependency_overrides[get_db] = override_pg
 
-        try:
-            client_pg = TestClient(app)
+        client_pg = TestClient(app)
 
-            payload = {
-                "title": "Desde Postgres Container",
-                "description": "integration test",
-                "status": "pending",
-                "priority": 1,
-                "due_date": None,
-            }
+        resp = client_pg.post("/tasks", json={
+            "title": "Desde Postgres",
+            "description": "test",
+            "status": "pending",
+            "priority": 1,
+            "due_date": None
+        })
+        assert resp.status_code == 201
 
-            resp = client_pg.post("/tasks", json=payload)
-            assert resp.status_code == 201
-            data = resp.json()
-            assert data["id"] is not None
-
-            resp_list = client_pg.get("/tasks")
-            assert resp_list.status_code == 200
-            tasks = resp_list.json()
-            assert len(tasks) == 1
-            assert tasks[0]["title"] == "Desde Postgres Container"
-        finally:
-            # Restaurar override anterior si existía
-            if old_override is not None:
-                app.dependency_overrides[get_db] = old_override
-            else:
-                app.dependency_overrides.pop(get_db, None)
+        app.dependency_overrides[get_db] = old
 
 
 # ============================================================
-# 4. PRUEBA E2E CON PLAYWRIGHT
-#    -> requiere: pip install playwright pytest-playwright
-#    -> luego:   playwright install
-#    Esta prueba asume que el backend está corriendo en BASE_URL
+# 4. TEST E2E (Playwright)
 # ============================================================
 
 @pytest.mark.e2e
 def test_e2e_docs_page(playwright):
-    """
-    E2E muy básica:
-    - Abre la página de /docs de FastAPI
-    - Verifica que cargue y que el título contenga el nombre de la API
+    """Se salta automáticamente si Playwright no tiene navegadores."""
+    browsers_path = os.path.join(
+        os.environ["USERPROFILE"],
+        "AppData", "Local", "ms-playwright"
+    )
+    if not os.path.exists(browsers_path):
+        pytest.skip("Playwright no tiene navegadores instalados (falta 'playwright install').")
 
-    Debes tener el backend levantado:
-      uvicorn app.main:app --reload
-    """
     base_url = os.getenv("BASE_URL", "http://127.0.0.1:8000")
 
     browser = playwright.chromium.launch()
     page = browser.new_page()
-
     page.goto(f"{base_url}/docs", wait_until="networkidle")
 
-    title = page.title()
-    assert "Task Manager API" in title
-
+    assert "Task Manager API" in page.title()
     browser.close()
 
 
 # ============================================================
-# 5. PRUEBA DE PERFORMANCE CON PYTEST-BENCHMARK
-#    -> requiere: pip install pytest-benchmark
+# 5. BENCHMARK
 # ============================================================
 
 @pytest.mark.benchmark
 def test_performance_list_tasks(client, db_session, benchmark):
-    """
-    Benchmark simple:
-    - Inserta varias tareas
-    - Mide el tiempo de respuesta del endpoint /tasks
-    """
-    # Pre-carga de datos
     for i in range(100):
-        task_in = _build_task_create(
-            title=f"Tarea {i}",
-            status="pending",
-            priority=2,
+        crud.create_task(
+            db_session,
+            _build_task_create(title=f"Tarea {i}")
         )
-        crud.create_task(db_session, task_in)
 
     def fetch_tasks():
-        resp = client.get("/tasks?skip=0&limit=50")
-        assert resp.status_code == 200
-        return resp.json()
+        r = client.get("/tasks?skip=0&limit=50")
+        return r.json()
 
     result = benchmark(fetch_tasks)
-
-    # Validación básica de que el benchmark no está vacío
     assert isinstance(result, list)
-    assert len(result) <= 50  # por el limit

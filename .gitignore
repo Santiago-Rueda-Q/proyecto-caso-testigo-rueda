@@ -1,0 +1,53 @@
+# 🐍 Entornos virtuales
+venv/
+.env
+*.env
+
+# 📦 Dependencias de Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# 🧪 Cachés de pruebas
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+
+# 📊 Benchmarks
+.benchmarks/
+
+# 🗃️ Bases de datos temporales
+*.sqlite3
+*.db
+test_tasks.db
+
+# 📁 Archivos de configuración del sistema
+.DS_Store
+Thumbs.db
+
+# 📦 Archivos de paquetes
+*.egg
+*.egg-info/
+dist/
+build/
+
+# 🔧 Archivos de configuración de herramientas
+*.vscode/
+*.idea/
+
+# 📄 Archivos de lock o logs
+*.log
+*.lock
+
+# 🚫 Ignorar archivos personales o temporales
+*.swp
+*.bak
+*.tmp
