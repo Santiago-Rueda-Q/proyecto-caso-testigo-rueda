@@ -4,3 +4,14 @@ SQLAlchemy==2.0.36
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
 pydantic==2.9.2
+fastapi
+uvicorn
+sqlalchemy
+python-dotenv
+psycopg2-binary           
+pytest
+pytest-cov
+pytest-benchmark
+testcontainers[postgresql]
+playwright
+pytest-playwright
